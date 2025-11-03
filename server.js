@@ -1,45 +1,38 @@
 import express from "express";
+import fs from "fs";
 import cors from "cors";
 import bodyParser from "body-parser";
 import { google } from "googleapis";
-import fs from "fs";
-import path from "path";
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json({ limit: "50mb" }));
+app.use(bodyParser.json({ limit: "100mb" }));
 
-// --- Configuration ---
-const PORT = process.env.PORT || 3000;
-const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID;
-
-// Authentification Google via ton fichier clé JSON (service account)
-const KEYFILE_PATH = "./service-account.json"; // on l’ajoutera ensuite
+// --- Google Drive Auth depuis la variable d’environnement ---
 const SCOPES = ["https://www.googleapis.com/auth/drive.file"];
+const keyJson = JSON.parse(process.env.GOOGLE_SERVICE_JSON);
 
 const auth = new google.auth.GoogleAuth({
-  keyFile: KEYFILE_PATH,
+  credentials: keyJson,
   scopes: SCOPES,
 });
 
 const drive = google.drive({ version: "v3", auth });
 
-// --- Route pour recevoir les fichiers RRWeb ---
+// --- Récupère l’ID du dossier Google Drive depuis l’environnement ---
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID;
+
+// --- Endpoint pour uploader un fichier ---
 app.post("/upload", async (req, res) => {
   try {
     const { filename, data } = req.body;
-    if (!filename || !data) {
-      return res.status(400).send("Missing filename or data");
-    }
-
-    const tempPath = path.join("/tmp", filename);
+    const tempPath = `/tmp/${filename}`;
     fs.writeFileSync(tempPath, Buffer.from(data, "base64"));
 
     const fileMetadata = {
       name: filename,
       parents: [DRIVE_FOLDER_ID],
     };
-
     const media = {
       mimeType: "video/webm",
       body: fs.createReadStream(tempPath),
@@ -59,4 +52,6 @@ app.post("/upload", async (req, res) => {
   }
 });
 
+// --- Lancer le serveur ---
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
