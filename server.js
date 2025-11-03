@@ -1,57 +1,85 @@
 import express from "express";
-import fs from "fs";
 import cors from "cors";
 import bodyParser from "body-parser";
 import { google } from "googleapis";
 
+// ---- Config via variables d'environnement Render ----
+const {
+  PORT = 3000,
+  DRIVE_FOLDER_ID,                 // ID du dossier Drive
+  GOOGLE_SERVICE_JSON,             // contenu JSON de la clé (variable Render)
+  ALLOWED_ORIGIN,                  // ex: https://tonsite.myshopify.com (optionnel)
+  REPLAY_SECRET                    // petit secret anti-abus (optionnel)
+} = process.env;
+
+// ---- CORS (autorise ta boutique si ALLOWED_ORIGIN est défini) ----
 const app = express();
-app.use(cors());
-app.use(bodyParser.json({ limit: "100mb" }));
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!ALLOWED_ORIGIN) return cb(null, true);
+    if (!origin || origin === ALLOWED_ORIGIN) return cb(null, true);
+    return cb(new Error("Origin not allowed"), false);
+  }
+}));
+app.use(bodyParser.json({ limit: "25mb" }));
 
-// --- Google Drive Auth depuis la variable d’environnement ---
+// ---- Auth Google Drive depuis la variable d'env ----
 const SCOPES = ["https://www.googleapis.com/auth/drive.file"];
-const keyJson = JSON.parse(process.env.GOOGLE_SERVICE_JSON);
-
-const auth = new google.auth.GoogleAuth({
-  credentials: keyJson,
-  scopes: SCOPES,
-});
-
+const keyJson = JSON.parse(GOOGLE_SERVICE_JSON);
+const auth = new google.auth.GoogleAuth({ credentials: keyJson, scopes: SCOPES });
 const drive = google.drive({ version: "v3", auth });
 
-// --- Récupère l’ID du dossier Google Drive depuis l’environnement ---
-const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID;
+// ---- Mémoire temporaire pour assembler les events rrweb ----
+const sessions = new Map(); // sessionId -> { events: [], lastTs }
 
-// --- Endpoint pour uploader un fichier ---
-app.post("/upload", async (req, res) => {
+// Petit middleware pour vérifier le secret (si défini)
+function checkSecret(req, res, next) {
+  if (!REPLAY_SECRET) return next();
+  const s = req.headers["x-replay-secret"];
+  if (s === REPLAY_SECRET) return next();
+  return res.status(401).send("unauthorized");
+}
+
+// Healthcheck
+app.get("/", (_req, res) => res.send("ok"));
+
+// Réception de chunks d'événements
+app.post("/replay/chunk", checkSecret, (req, res) => {
+  const { sessionId, events } = req.body || {};
+  if (!sessionId || !Array.isArray(events)) return res.status(400).send("bad request");
+  if (!sessions.has(sessionId)) sessions.set(sessionId, { events: [], lastTs: Date.now() });
+  const s = sessions.get(sessionId);
+  s.events.push(...events);
+  s.lastTs = Date.now();
+  return res.status(204).end();
+});
+
+// Fin de session → upload JSON vers Drive
+app.post("/replay/finish", checkSecret, async (req, res) => {
   try {
-    const { filename, data } = req.body;
-    const tempPath = `/tmp/${filename}`;
-    fs.writeFileSync(tempPath, Buffer.from(data, "base64"));
+    const { sessionId, meta } = req.body || {};
+    const s = sessions.get(sessionId);
+    if (!sessionId || !s) return res.status(400).send("unknown session");
 
-    const fileMetadata = {
-      name: filename,
-      parents: [DRIVE_FOLDER_ID],
-    };
-    const media = {
-      mimeType: "video/webm",
-      body: fs.createReadStream(tempPath),
-    };
-
-    const uploadedFile = await drive.files.create({
-      resource: fileMetadata,
-      media: media,
-      fields: "id",
+    const content = JSON.stringify({
+      sessionId,
+      createdAt: new Date().toISOString(),
+      meta: meta || {},
+      events: s.events
     });
 
-    fs.unlinkSync(tempPath);
-    res.send({ success: true, fileId: uploadedFile.data.id });
-  } catch (error) {
-    console.error("Erreur upload:", error);
-    res.status(500).send("Erreur serveur");
+    await drive.files.create({
+      resource: { name: `rrweb-${sessionId}.json`, parents: [DRIVE_FOLDER_ID] },
+      media: { mimeType: "application/json", body: Buffer.from(content, "utf8") },
+      fields: "id"
+    });
+
+    sessions.delete(sessionId);
+    res.status(200).send("uploaded");
+  } catch (e) {
+    console.error(e);
+    res.status(500).send("upload error");
   }
 });
 
-// --- Lancer le serveur ---
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Uploader running on :${PORT}`));
