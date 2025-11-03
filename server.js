@@ -1,149 +1,188 @@
-// server.js (ESM)
+// server.js
+// ---- rrweb → Google Drive uploader (Express) ----
 
 import express from "express";
 import bodyParser from "body-parser";
 import { google } from "googleapis";
 
 // ---------- ENV ----------
-const PORT = process.env.PORT || 10000;
-const REPLAY_SECRET = process.env.REPLAY_SECRET || "";
-const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || "";
-// Autoriser une ou plusieurs origines, séparées par des virgules
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || "https://my-sereneye.com")
+const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
+
+// Origines autorisées, séparées par virgule
+const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGIN || "")
   .split(",")
-  .map(s => s.trim())
+  .map((s) => s.trim())
   .filter(Boolean);
 
-// Clé service account (collée telle quelle dans GOOGLE_SERVICE_JSON)
+const REPLAY_SECRET = process.env.REPLAY_SECRET || "";
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || "";
+const GOOGLE_SERVICE_JSON = process.env.GOOGLE_SERVICE_JSON || "";
+
+// ---------- Google Drive auth ----------
 let GOOGLE_CREDS = null;
-try {
-  GOOGLE_CREDS = JSON.parse(process.env.GOOGLE_SERVICE_JSON || "{}");
-} catch (e) {
-  console.error("Invalid GOOGLE_SERVICE_JSON:", e);
+if (!GOOGLE_SERVICE_JSON) {
+  console.warn("⚠️ GOOGLE_SERVICE_JSON absent : l’upload Drive échouera.");
+} else {
+  try {
+    GOOGLE_CREDS = JSON.parse(GOOGLE_SERVICE_JSON);
+    // IMPORTANT : corriger les \n si collé en 1 ligne dans les variables d'env
+    if (typeof GOOGLE_CREDS.private_key === "string") {
+      GOOGLE_CREDS.private_key = GOOGLE_CREDS.private_key.replace(/\\n/g, "\n");
+    }
+  } catch (e) {
+    console.error("❌ GOOGLE_SERVICE_JSON invalide :", e);
+  }
 }
 
+const auth =
+  GOOGLE_CREDS &&
+  new google.auth.GoogleAuth({
+    credentials: GOOGLE_CREDS,
+    scopes: ["https://www.googleapis.com/auth/drive.file"],
+  });
+
+const drive = auth ? google.drive({ version: "v3", auth }) : null;
+
+// ---------- App ----------
 const app = express();
 
-// ---------- CORS dynamique et compatible credentials ----------
+// CORS souple avec reflet d'origine + préflight
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+  if (origin && ALLOWED_ORIGIN.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Credentials", "true");
+
+    // refléter les headers demandés par le préflight si présents
+    const reqHeaders = req.headers["access-control-request-headers"];
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type, X-REPLAY-SECRET, Authorization, X-Requested-With"
+      reqHeaders || "Content-Type, X-REPLAY-SECRET, Authorization, X-Requested-With"
     );
     res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    // (facultatif) exposer des headers si besoin
     res.setHeader("Access-Control-Expose-Headers", "Content-Type");
   }
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// ---------- Parsers ----------
-app.use(bodyParser.json({ limit: "10mb" }));
-app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json({ limit: "50mb" }));
 
-// ---------- Mémoire sessions ----------
-/** @type {Map<string, {events:any[], lastTs:number}>} */
-const sessions = new Map();
-
-// ---------- Google Drive ----------
-function getDriveClient() {
-  if (!GOOGLE_CREDS || !GOOGLE_CREDS.client_email) {
-    throw new Error("Missing/invalid GOOGLE_SERVICE_JSON");
-  }
-  const auth = new google.auth.GoogleAuth({
-    credentials: GOOGLE_CREDS,
-    scopes: ["https://www.googleapis.com/auth/drive"],
-  });
-  return google.drive({ version: "v3", auth });
-}
-
-async function uploadJsonToDrive(name, jsonStr) {
-  const drive = getDriveClient();
-  const res = await drive.files.create({
-    requestBody: {
-      name,
-      parents: DRIVE_FOLDER_ID ? [DRIVE_FOLDER_ID] : undefined,
-    },
-    media: {
-      mimeType: "application/json",
-      body: Buffer.from(jsonStr, "utf8"),
-    },
-    fields: "id,name",
-  });
-  return res.data;
-}
-
-// ---------- Middlewares ----------
+// Vérification du secret envoyé par le client
 function checkSecret(req, res, next) {
-  const got = req.header("X-REPLAY-SECRET") || "";
-  if (!REPLAY_SECRET || got !== REPLAY_SECRET) {
+  const incoming = req.headers["x-replay-secret"];
+  if (!REPLAY_SECRET || incoming !== REPLAY_SECRET) {
     return res.status(401).send("unauthorized");
   }
   next();
 }
 
+// Mémoire des sessions (simple Map ; pour la prod, préférer Redis/S3, etc.)
+const sessions = new Map();
+
 // ---------- Routes ----------
-app.get("/", (_req, res) => {
-  res.type("text/plain").send("rrweb-uploader live");
+app.get("/health", (_req, res) => res.status(200).send("ok"));
+
+// Le client “annonce” la session (facultatif mais propre)
+app.post("/replay/start", checkSecret, (req, res) => {
+  try {
+    const { sessionId, meta } = req.body || {};
+    if (!sessionId) return res.status(400).send("missing sessionId");
+    if (!sessions.has(sessionId)) {
+      sessions.set(sessionId, { events: [], meta: meta || {}, startedAt: Date.now() });
+    }
+    return res.status(200).send("ok");
+  } catch (e) {
+    console.error("start error", e);
+    return res.status(500).send("start error");
+  }
 });
 
-// Réception des chunks rrweb
 app.post("/replay/chunk", checkSecret, (req, res) => {
   try {
-    const { sessionId, events = [] } = req.body || {};
-    if (!sessionId) return res.status(400).send("missing sessionId");
-    if (!Array.isArray(events)) return res.status(400).send("events must be array");
-
-    let s = sessions.get(sessionId);
-    if (!s) {
-      s = { events: [], lastTs: Date.now() };
-      sessions.set(sessionId, s);
+    const { sessionId, events } = req.body || {};
+    if (!sessionId || !Array.isArray(events)) {
+      return res.status(400).send("missing sessionId or events");
     }
+    if (!sessions.has(sessionId)) {
+      sessions.set(sessionId, { events: [], startedAt: Date.now() });
+    }
+    const s = sessions.get(sessionId);
     s.events.push(...events);
-    s.lastTs = Date.now();
-
-    res.status(200).send("ok");
+    s.lastChunkAt = Date.now();
+    return res.status(200).send("ok");
   } catch (e) {
     console.error("chunk error", e);
-    res.status(500).send("error");
+    return res.status(500).send("chunk error");
   }
 });
 
-// Fin de session : assemble et envoie sur Drive
 app.post("/replay/finish", checkSecret, async (req, res) => {
   try {
-    const { sessionId, meta = {} } = req.body || {};
+    const { sessionId, meta } = req.body || {};
     if (!sessionId) return res.status(400).send("missing sessionId");
 
-    const s = sessions.get(sessionId);
-    if (!s || !s.events) return res.status(400).send("unknown session");
+    const s = sessions.get(sessionId) || { events: [], meta: {} };
+    // Fusion des meta envoyées au start/finish
+    const combinedMeta = { ...(s.meta || {}), ...(meta || {}) };
 
-    const content = {
+    // Nom de fichier lisible
+    const ts = new Date();
+    const iso = ts.toISOString().replace(/[:]/g, "-");
+    const name = `session-${sessionId}-${iso}.json`;
+
+    if (!drive || !DRIVE_FOLDER_ID) {
+      console.error("Drive non configuré : pas d'upload");
+      sessions.delete(sessionId);
+      return res.status(500).send("drive not configured");
+    }
+
+    const data = {
       sessionId,
-      createdAt: new Date().toISOString(),
-      meta,
-      events: s.events,
+      createdAt: ts.toISOString(),
+      meta: combinedMeta,
+      events: s.events || [],
+      counts: { events: (s.events && s.events.length) || 0 },
     };
 
-    const jsonStr = JSON.stringify(content);
-    const fileName = `rrweb-${sessionId}.json`;
-    const file = await uploadJsonToDrive(fileName, jsonStr);
+    const fileMetadata = {
+      name,
+      parents: [DRIVE_FOLDER_ID],
+    };
 
+    const media = {
+      mimeType: "application/json",
+      body: Buffer.from(JSON.stringify(data, null, 2)),
+    };
+
+    const result = await drive.files.create({
+      requestBody: fileMetadata,
+      media,
+      fields: "id, name",
+    });
+
+    // nettoyage mémoire
     sessions.delete(sessionId);
-    res.status(200).json({ success: true, fileId: file.id, name: file.name });
+
+    return res.status(200).json({
+      status: "uploaded",
+      fileId: result.data.id,
+      fileName: result.data.name,
+      events: data.counts.events,
+    });
   } catch (e) {
-    console.error("finish error", e);
-    res.status(500).send("upload error");
+    console.error("finish error", e?.response?.data || e);
+    return res.status(500).send("upload error");
   }
 });
 
-// ---------- Start ----------
+// ---------- Lancement ----------
 app.listen(PORT, () => {
-  console.log(`✅ Uploader running on :${PORT}`);
+  console.log(`▶ rrweb-uploader listening on :${PORT}`);
+  if (ALLOWED_ORIGIN.length) {
+    console.log("   Allowed origins:", ALLOWED_ORIGIN.join(", "));
+  } else {
+    console.log("   ⚠️ No ALLOWED_ORIGIN configured");
+  }
 });
