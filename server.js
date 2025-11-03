@@ -1,61 +1,73 @@
-// server.js
-// ---- rrweb → Google Drive uploader (Express) ----
+// server.js — rrweb → Google Drive (OAuth prioritaire, fallback Service Account)
 
 import express from "express";
 import bodyParser from "body-parser";
 import { google } from "googleapis";
 import { Readable } from "stream";
 
-// ---------- ENV ----------
-const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
-
-// Origines autorisées, séparées par virgule
+// ────────── ENV ──────────
+const PORT = Number(process.env.PORT || 10000);
 const ALLOWED_ORIGIN = (process.env.ALLOWED_ORIGIN || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
+  .split(",").map(s => s.trim()).filter(Boolean);
 const REPLAY_SECRET = process.env.REPLAY_SECRET || "";
 const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || "";
+
+// OAuth vars (accepte GOOGLE_* ou OAUTH_*)
+const OAUTH_CLIENT_ID =
+  process.env.GOOGLE_CLIENT_ID || process.env.OAUTH_CLIENT_ID || "";
+const OAUTH_CLIENT_SECRET =
+  process.env.GOOGLE_CLIENT_SECRET || process.env.OAUTH_CLIENT_SECRET || "";
+const OAUTH_REFRESH_TOKEN = process.env.OAUTH_REFRESH_TOKEN || "";
+
+// Service Account (fallback)
 const GOOGLE_SERVICE_JSON = process.env.GOOGLE_SERVICE_JSON || "";
 
-// ---------- Google Drive auth ----------
-let GOOGLE_CREDS = null;
-if (!GOOGLE_SERVICE_JSON) {
-  console.warn("⚠️ GOOGLE_SERVICE_JSON absent : l’upload Drive échouera.");
-} else {
-  try {
-    GOOGLE_CREDS = JSON.parse(GOOGLE_SERVICE_JSON);
-    // IMPORTANT : corriger les \n si collé en 1 ligne dans les variables d'env
-    if (typeof GOOGLE_CREDS.private_key === "string") {
-      GOOGLE_CREDS.private_key = GOOGLE_CREDS.private_key.replace(/\\n/g, "\n");
-    }
-  } catch (e) {
-    console.error("❌ GOOGLE_SERVICE_JSON invalide :", e);
-  }
-}
+// ────────── AUTH GOOGLE (OAuth > Service Account) ──────────
+let auth = null;
 
-const auth =
-  GOOGLE_CREDS &&
-  new google.auth.GoogleAuth({
-    credentials: GOOGLE_CREDS,
-    scopes: ["https://www.googleapis.com/auth/drive.file"],
-  });
+if (OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && OAUTH_REFRESH_TOKEN) {
+  // OAuth (propriété des fichiers: ton compte)
+  const oAuth2 = new google.auth.OAuth2(
+    OAUTH_CLIENT_ID,
+    OAUTH_CLIENT_SECRET,
+    // redirect non utilisé pendant le refresh, mais gardé pour clarté
+    "https://developers.google.com/oauthplayground"
+  );
+  oAuth2.setCredentials({ refresh_token: OAUTH_REFRESH_TOKEN });
+  auth = oAuth2;
+  console.log("🔐 Using OAuth client (files owned by YOUR Google account)");
+} else if (GOOGLE_SERVICE_JSON) {
+  // Fallback Service Account (si configuré)
+  try {
+    const creds = JSON.parse(GOOGLE_SERVICE_JSON);
+    if (typeof creds.private_key === "string") {
+      // corrige les \n si collé en 1 ligne
+      creds.private_key = creds.private_key.replace(/\\n/g, "\n");
+    }
+    auth = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ["https://www.googleapis.com/auth/drive.file"],
+    });
+    console.log("🔐 Using Service Account credentials (check shared drive/quota)");
+  } catch (e) {
+    console.error("❌ Invalid GOOGLE_SERVICE_JSON:", e);
+  }
+} else {
+  console.warn("⚠️ No Google credentials configured (OAuth or Service Account)");
+}
 
 const drive = auth ? google.drive({ version: "v3", auth }) : null;
 
-// ---------- App ----------
+// ────────── APP ──────────
 const app = express();
 
-// CORS souple avec reflet d'origine + préflight
+// CORS souple + préflight
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (origin && ALLOWED_ORIGIN.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Credentials", "true");
-
-    // Refléter les headers demandés par le préflight si présents
     const reqHeaders = req.headers["access-control-request-headers"];
     res.setHeader(
       "Access-Control-Allow-Headers",
@@ -70,7 +82,7 @@ app.use((req, res, next) => {
 
 app.use(bodyParser.json({ limit: "50mb" }));
 
-// Vérification du secret envoyé par le client
+// Secret requis sur toutes les routes rrweb
 function checkSecret(req, res, next) {
   const incoming = req.headers["x-replay-secret"];
   if (!REPLAY_SECRET || incoming !== REPLAY_SECRET) {
@@ -79,13 +91,12 @@ function checkSecret(req, res, next) {
   next();
 }
 
-// Mémoire des sessions (simple Map ; pour la prod, préférer Redis/S3, etc.)
+// Mémoire des sessions (pour la prod: préférer Redis/S3/etc.)
 const sessions = new Map();
 
-// ---------- Routes ----------
+// ────────── ROUTES ──────────
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// Le client “annonce” la session (facultatif mais propre)
 app.post("/replay/start", checkSecret, (req, res) => {
   try {
     const { sessionId, meta } = req.body || {};
@@ -123,21 +134,14 @@ app.post("/replay/finish", checkSecret, async (req, res) => {
   try {
     const { sessionId, meta } = req.body || {};
     if (!sessionId) return res.status(400).send("missing sessionId");
+    if (!drive || !DRIVE_FOLDER_ID) return res.status(500).send("drive not configured");
 
     const s = sessions.get(sessionId) || { events: [], meta: {} };
-    // Fusion des meta envoyées au start/finish
     const combinedMeta = { ...(s.meta || {}), ...(meta || {}) };
 
-    // Nom de fichier lisible
     const ts = new Date();
     const iso = ts.toISOString().replace(/[:]/g, "-");
     const name = `session-${sessionId}-${iso}.json`;
-
-    if (!drive || !DRIVE_FOLDER_ID) {
-      console.error("Drive non configuré : pas d'upload");
-      sessions.delete(sessionId);
-      return res.status(500).send("drive not configured");
-    }
 
     const data = {
       sessionId,
@@ -147,26 +151,21 @@ app.post("/replay/finish", checkSecret, async (req, res) => {
       counts: { events: (s.events && s.events.length) || 0 },
     };
 
-    // ✅ envoyer un flux lisible (stream) au SDK Google pour éviter "part.body.pipe is not a function"
+    // Upload JSON en stream (fiable)
     const json = JSON.stringify(data, null, 2);
-    const media = {
-      mimeType: "application/json",
-      body: Readable.from([json]),
-    };
-
-    const fileMetadata = {
-      name,
-      parents: [DRIVE_FOLDER_ID],
-    };
+    const media = { mimeType: "application/json", body: Readable.from([json]) };
+    const requestBody = { name, parents: [DRIVE_FOLDER_ID] };
 
     const result = await drive.files.create({
-      requestBody: fileMetadata,
+      requestBody,
       media,
       fields: "id, name",
       uploadType: "multipart",
+      // Décommente si tu utilises un Drive PARTAGÉ (Google Workspace) :
+      // supportsAllDrives: true,
     });
 
-    // nettoyage mémoire
+    // Nettoyage
     sessions.delete(sessionId);
 
     return res.status(200).json({
@@ -181,7 +180,7 @@ app.post("/replay/finish", checkSecret, async (req, res) => {
   }
 });
 
-// ---------- Lancement ----------
+// ────────── START ──────────
 app.listen(PORT, () => {
   console.log(`▶ rrweb-uploader listening on :${PORT}`);
   if (ALLOWED_ORIGIN.length) {
