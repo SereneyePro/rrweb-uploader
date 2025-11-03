@@ -3,63 +3,109 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import { google } from "googleapis";
 
-// ---- Config via variables d'environnement Render ----
+// ====== ENV ======
 const {
-  PORT = 3000,
-  DRIVE_FOLDER_ID,                 // ID du dossier Drive
-  GOOGLE_SERVICE_JSON,             // contenu JSON de la clé (variable Render)
-  ALLOWED_ORIGIN,                  // ex: https://tonsite.myshopify.com (optionnel)
-  REPLAY_SECRET                    // petit secret anti-abus (optionnel)
+  PORT = 10000,
+  DRIVE_FOLDER_ID,                 // ID du dossier Drive (parents)
+  GOOGLE_SERVICE_JSON,             // contenu de la clé JSON du service account
+  ALLOWED_ORIGIN = "",             // ex: "https://my-sereneye.com,https://www.my-sereneye.com"
+  REPLAY_SECRET = "",              // ex: "SER89!"
+  LOG_ORIGIN = "false"             // "true" pour logguer l'origine des requêtes
 } = process.env;
 
-// ---- CORS (autorise ta boutique si ALLOWED_ORIGIN est défini) ----
+// ====== App ======
 const app = express();
+
+// CORS whitelist multi-domaines
+const allowList = ALLOWED_ORIGIN
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
 app.use(cors({
   origin: (origin, cb) => {
-    if (!ALLOWED_ORIGIN) return cb(null, true);
-    if (!origin || origin === ALLOWED_ORIGIN) return cb(null, true);
+    if (LOG_ORIGIN === "true") console.log("Origin:", origin);
+    // Si pas de liste → autoriser tout (utile pour debug). En prod, laisse ALLOWED_ORIGIN rempli.
+    if (allowList.length === 0) return cb(null, true);
+    // Requêtes sans origin (ex. curl) → OK
+    if (!origin) return cb(null, true);
+    if (allowList.includes(origin)) return cb(null, true);
     return cb(new Error("Origin not allowed"), false);
-  }
+  })
 }));
+
+// Corps JSON (max 25 Mo pour de gros replays)
 app.use(bodyParser.json({ limit: "25mb" }));
 
-// ---- Auth Google Drive depuis la variable d'env ----
+// Anti-cache
+app.use((_, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+});
+
+// ====== Auth Google Drive ======
 const SCOPES = ["https://www.googleapis.com/auth/drive.file"];
-const keyJson = JSON.parse(GOOGLE_SERVICE_JSON);
-const auth = new google.auth.GoogleAuth({ credentials: keyJson, scopes: SCOPES });
-const drive = google.drive({ version: "v3", auth });
+let auth, drive;
+try {
+  const keyJson = JSON.parse(GOOGLE_SERVICE_JSON || "{}");
+  auth = new google.auth.GoogleAuth({ credentials: keyJson, scopes: SCOPES });
+  drive = google.drive({ version: "v3", auth });
+} catch (e) {
+  console.error("❌ GOOGLE_SERVICE_JSON invalide ou manquant:", e.message);
+}
 
-// ---- Mémoire temporaire pour assembler les events rrweb ----
+// ====== Mémoire temporaire des sessions ======
 const sessions = new Map(); // sessionId -> { events: [], lastTs }
+const SESSION_TTL_MS = 1000 * 60 * 30; // 30 min
 
-// Petit middleware pour vérifier le secret (si défini)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of sessions.entries()) {
+    if (now - s.lastTs > SESSION_TTL_MS) {
+      sessions.delete(id);
+    }
+  }
+}, 60_000);
+
+// ====== Middleware secret ======
 function checkSecret(req, res, next) {
-  if (!REPLAY_SECRET) return next();
-  const s = req.headers["x-replay-secret"];
-  if (s === REPLAY_SECRET) return next();
+  if (!REPLAY_SECRET) return next(); // si vide → pas de vérif (éviter en prod)
+  const header = req.headers["x-replay-secret"];
+  const q = req.query?.secret;
+  if (header === REPLAY_SECRET || q === REPLAY_SECRET) return next();
   return res.status(401).send("unauthorized");
 }
 
-// Healthcheck
+// ====== Routes ======
 app.get("/", (_req, res) => res.send("ok"));
 
-// Réception de chunks d'événements
+// reçoit des chunks d'évènements rrweb
 app.post("/replay/chunk", checkSecret, (req, res) => {
-  const { sessionId, events } = req.body || {};
-  if (!sessionId || !Array.isArray(events)) return res.status(400).send("bad request");
-  if (!sessions.has(sessionId)) sessions.set(sessionId, { events: [], lastTs: Date.now() });
-  const s = sessions.get(sessionId);
-  s.events.push(...events);
-  s.lastTs = Date.now();
-  return res.status(204).end();
+  try {
+    const { sessionId, events } = req.body || {};
+    if (!sessionId || !Array.isArray(events)) {
+      return res.status(400).send("bad request");
+    }
+    if (!sessions.has(sessionId)) {
+      sessions.set(sessionId, { events: [], lastTs: Date.now() });
+    }
+    const s = sessions.get(sessionId);
+    s.events.push(...events);
+    s.lastTs = Date.now();
+    return res.status(204).end();
+  } catch (e) {
+    console.error("chunk error:", e);
+    return res.status(500).send("error");
+  }
 });
 
-// Fin de session → upload JSON vers Drive
+// fin de session → dump JSON vers Google Drive
 app.post("/replay/finish", checkSecret, async (req, res) => {
   try {
     const { sessionId, meta } = req.body || {};
     const s = sessions.get(sessionId);
     if (!sessionId || !s) return res.status(400).send("unknown session");
+    if (!drive || !DRIVE_FOLDER_ID) return res.status(500).send("drive not configured");
 
     const content = JSON.stringify({
       sessionId,
@@ -68,18 +114,24 @@ app.post("/replay/finish", checkSecret, async (req, res) => {
       events: s.events
     });
 
-    await drive.files.create({
-      resource: { name: `rrweb-${sessionId}.json`, parents: [DRIVE_FOLDER_ID] },
+    const response = await drive.files.create({
+      resource: {
+        name: `rrweb-${sessionId}.json`,
+        parents: [DRIVE_FOLDER_ID]
+      },
       media: { mimeType: "application/json", body: Buffer.from(content, "utf8") },
-      fields: "id"
+      fields: "id,name,parents"
     });
 
     sessions.delete(sessionId);
-    res.status(200).send("uploaded");
+    return res.status(200).send("uploaded");
   } catch (e) {
-    console.error(e);
-    res.status(500).send("upload error");
+    console.error("finish error:", e?.response?.data || e.message || e);
+    return res.status(500).send("upload error");
   }
 });
 
-app.listen(PORT, () => console.log(`✅ Uploader running on :${PORT}`));
+// ====== Start ======
+app.listen(PORT, () => {
+  console.log(`✅ Uploader running on :${PORT}`);
+});
