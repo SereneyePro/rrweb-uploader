@@ -1,15 +1,16 @@
 {
-  "name": "rrweb-drive-uploader",
-  "private": true,
+  "name": "rrweb-uploader",
+  "version": "1.0.0",
+  "description": "Serveur Node pour uploader les sessions rrweb vers Google Drive",
+  "main": "server.js",
   "type": "module",
-  "dependencies": {
-    "express": "^4.19.2",
-    "googleapis": "^133.0.0",
-    "cors": "^2.8.5",
-    "body-parser": "^1.20.2"
-  },
   "scripts": {
     "start": "node server.js"
+  },
+  "dependencies": {
+    "body-parser": "^1.20.3",
+    "express": "^4.19.2",
+    "googleapis": "^131.0.0"
   },
   "engines": {
     "node": ">=18"
