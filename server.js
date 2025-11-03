@@ -4,6 +4,7 @@
 import express from "express";
 import bodyParser from "body-parser";
 import { google } from "googleapis";
+import { Readable } from "stream";
 
 // ---------- ENV ----------
 const PORT = process.env.PORT ? Number(process.env.PORT) : 10000;
@@ -54,13 +55,13 @@ app.use((req, res, next) => {
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Credentials", "true");
 
-    // refléter les headers demandés par le préflight si présents
+    // Refléter les headers demandés par le préflight si présents
     const reqHeaders = req.headers["access-control-request-headers"];
     res.setHeader(
       "Access-Control-Allow-Headers",
       reqHeaders || "Content-Type, X-REPLAY-SECRET, Authorization, X-Requested-With"
     );
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
     res.setHeader("Access-Control-Expose-Headers", "Content-Type");
   }
   if (req.method === "OPTIONS") return res.sendStatus(204);
@@ -146,20 +147,23 @@ app.post("/replay/finish", checkSecret, async (req, res) => {
       counts: { events: (s.events && s.events.length) || 0 },
     };
 
+    // ✅ envoyer un flux lisible (stream) au SDK Google pour éviter "part.body.pipe is not a function"
+    const json = JSON.stringify(data, null, 2);
+    const media = {
+      mimeType: "application/json",
+      body: Readable.from([json]),
+    };
+
     const fileMetadata = {
       name,
       parents: [DRIVE_FOLDER_ID],
-    };
-
-    const media = {
-      mimeType: "application/json",
-      body: Buffer.from(JSON.stringify(data, null, 2)),
     };
 
     const result = await drive.files.create({
       requestBody: fileMetadata,
       media,
       fields: "id, name",
+      uploadType: "multipart",
     });
 
     // nettoyage mémoire
